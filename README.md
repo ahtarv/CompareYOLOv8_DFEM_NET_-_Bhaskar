@@ -85,7 +85,7 @@ If you use this code or architecture, please cite the original DFEM-Net paper:
 
 > *"DFEM-Net: A dynamic adaptive feature extraction network based deep learning model for pedestrian and vehicle detection"* (2026).
 
-**BhaskarNet** was developed as a specialized optimization study by [Your Name] at DJ Sanghvi College of Engineering.
+**BhaskarNet** was developed as a specialized optimization study by Atharv Kamlesh Patil at DJ Sanghvi College of Engineering.
 
 ---
 
