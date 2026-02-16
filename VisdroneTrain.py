@@ -1,6 +1,11 @@
+
 import os
 import sys
 import subprocess
+import random
+import glob
+import re
+
 
 # --- AUTO-INSTALL DEPENDENCIES ---
 try:
@@ -11,7 +16,14 @@ except ImportError:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "ultralytics"])
     import ultralytics
 
+
 from ultralytics import YOLO
+
+# --- 1. CONFIGURATION ---
+TARGET_TRAIN = 1000  # We keep 1k images for training
+TARGET_VAL = 200     # We keep 200 images for validation
+EPOCHS = 10          # 10 Epochs is sufficient for a 1k subset
+
 
 # ==========================================
 # 1. DEFINE FILE CONTENTS
@@ -428,6 +440,10 @@ class DeformableConv2d(nn.Module):
         
         sampling_locations_flat = sampling_locations_norm.view(N, H_out, -1, 2) 
         
+        # FIX: Ensure grid dtype matches input dtype (crucial for AMP/Half Precision)
+        if sampling_locations_flat.dtype != x.dtype:
+            sampling_locations_flat = sampling_locations_flat.to(x.dtype)
+
         # Sample! 
         # x: [N, C, H, W]
         # grid: [N, H_out, W_out * kh * kw, 2]
@@ -597,6 +613,45 @@ def write_file(path, content):
     with open(path, 'w') as f:
         f.write(content)
 
+# --- SHRINK DATASET FUNCTION ---
+def shrink_dataset(image_dir, label_dir, target_count):
+    # Get all images
+    images = glob.glob(os.path.join(image_dir, '*.*'))
+    total_images = len(images)
+    
+    if total_images <= target_count:
+        print(f"✅ {image_dir} is already small enough ({total_images} images). Skipping.")
+        return
+
+    print(f"📉 Reducing {image_dir} from {total_images} -> {target_count} images...")
+    
+    # SHUFFLE to ensure a BALANCED random distribution (Statistical Sampling)
+    random.seed(42) # Fixed seed so results are reproducible
+    random.shuffle(images)
+    
+    # Select victims (Files to delete)
+    files_to_delete = images[target_count:] # Keep first N, delete the rest
+    
+    deleted_count = 0
+    for img_path in files_to_delete:
+        try:
+            # 1. Delete Image
+            os.remove(img_path)
+            
+            # 2. Delete Matching Label
+            # Construct label path: .../images/train/x.jpg -> .../labels/train/x.txt
+            basename = os.path.basename(img_path).rsplit('.', 1)[0]
+            lbl_path = os.path.join(label_dir, basename + '.txt')
+            
+            if os.path.exists(lbl_path):
+                os.remove(lbl_path)
+            
+            deleted_count += 1
+        except Exception as e:
+            print(f"Error deleting {img_path}: {e}")
+            
+    print(f"🗑️ Deleted {deleted_count} pairs. New size: {target_count} images.")
+
 def setup_bhaskar():
     base = "Bhaskar_Experiment"
     os.makedirs(base, exist_ok=True)
@@ -611,9 +666,10 @@ def setup_bhaskar():
     script = RUNNER_SCRIPT_TEMPLATE.replace("{MODEL_NAME}", "BhaskarNet")
     script = script.replace("{YAML_FILE}", "bhaskar_net.yaml")
     script = script.replace("{RUN_NAME}", "Bhaskar_Run")
-    script = script.replace("{EPOCHS}", "50")
+    script = script.replace("{EPOCHS}", str(EPOCHS))
     script = script.replace("{AMP}", "True") # BhaskarNet works with AMP
     write_file(os.path.join(base, "train_bhaskar.py"), script)
+
 
 def setup_dfem():
     base = "DFEM_Experiment"
@@ -629,10 +685,11 @@ def setup_dfem():
     script = RUNNER_SCRIPT_TEMPLATE.replace("{MODEL_NAME}", "DFEM-Net")
     script = script.replace("{YAML_FILE}", "dfem_net.yaml")
     script = script.replace("{RUN_NAME}", "DFEM_Run")
-    script = script.replace("{EPOCHS}", "50")
+    script = script.replace("{EPOCHS}", str(EPOCHS))
     # Pure Python implementation is stable with AMP
     script = script.replace("{AMP}", "True") 
     write_file(os.path.join(base, "train_dfem.py"), script)
+
 
 def main():
     print("--- 1. Setting up Workspaces ---")
@@ -640,22 +697,61 @@ def main():
     setup_dfem()
     print("Workspaces created: Bhaskar_Experiment/, DFEM_Experiment/")
     
-    # Download COCO128 if not present (handled by YOLO auto-download usually, but usually caches)
+    # --- DATASET PRUNING ---
+    print(f"--- ✂️ STARTING DATASET REDUCTION (Target: {TARGET_TRAIN} Train / {TARGET_VAL} Val) ---")
+    
+    # Force download if needed
+    visdrone_path = os.path.join(os.getcwd(), 'datasets', 'VisDrone')
+    parent_visdrone_path = os.path.join(os.getcwd(), '..', 'datasets', 'VisDrone')
+    
+    if not os.path.exists(visdrone_path) and not os.path.exists(parent_visdrone_path):
+         # Try to trigger download via dummy train
+         print("Dataset not found. Triggering download...")
+         try:
+             model = YOLO('yolov8n.yaml')
+             # Just checking if we can trigger download
+             model.train(data='VisDrone.yaml', epochs=1, imgsz=640, batch=1, name='setup_download')
+         except:
+             pass
+
+    # Locate dataset
+    base_path = None
+    if os.path.exists(visdrone_path):
+        base_path = visdrone_path
+    elif os.path.exists(parent_visdrone_path):
+        base_path = parent_visdrone_path
+    else:
+        # Fallback assumption
+        base_path = 'datasets/VisDrone'
+
+    if base_path and os.path.exists(base_path):
+         # Check structure. YOLO format usually images/train
+         if os.path.exists(os.path.join(base_path, 'images', 'train')):
+             shrink_dataset(os.path.join(base_path, 'images', 'train'), os.path.join(base_path, 'labels', 'train'), TARGET_TRAIN)
+             shrink_dataset(os.path.join(base_path, 'images', 'val'),   os.path.join(base_path, 'labels', 'val'),   TARGET_VAL)
+         else:
+             print(f"Warning: Standard 'images/train' structure not found in {base_path}. Attempting to search recursively or skipping.")
+    else:
+         print(f"Warning: Could not locate dataset at {base_path}. Skipping reduction.")
+
     
     print("\n--- 2. Training YOLOv8 (Benchmark) ---")
-    try:
-        model = YOLO('yolov8n.yaml')
-        # Using VisDrone.yaml (Ultralytics handles download automatically)
-        model.train(data='VisDrone.yaml', epochs=50, imgsz=640, project='Kaggle_Benchmark_VisDrone', name='YOLOv8_Run')
-    except Exception as e:
-        print(f"YOLOv8 Training Failed: {e}")
+    print("Skipping YOLOv8 (Already trained)")
+    # try:
+    #     model = YOLO('yolov8n.yaml')
+    #     # Using VisDrone.yaml (Ultralytics handles download automatically)
+    #     model.train(data='VisDrone.yaml', epochs=EPOCHS, imgsz=640, project='Kaggle_Benchmark_VisDrone', name='YOLOv8_Run')
+
+    # except Exception as e:
+    #     print(f"YOLOv8 Training Failed: {e}")
 
     print("\n--- 3. Training BhaskarNet ---")
-    try:
-        # Run in subprocess to isolate modules
-        subprocess.run([sys.executable, "train_bhaskar.py"], check=True, cwd="Bhaskar_Experiment")
-    except Exception as e:
-        print(f"BhaskarNet Training Failed: {e}")
+    print("Skipping BhaskarNet (Already trained)")
+    # try:
+    #     # Run in subprocess to isolate modules
+    #     subprocess.run([sys.executable, "train_bhaskar.py"], check=True, cwd="Bhaskar_Experiment")
+    # except Exception as e:
+    #     print(f"BhaskarNet Training Failed: {e}")
 
     print("\n--- 4. Training DFEM-Net ---")
     try:
