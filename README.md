@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # Comparative Analysis of YOLOv8 and Advanced Feature Extraction Networks (DFEM-Net, Bhaskar-Net)
 
 ## 📌 Abstract
