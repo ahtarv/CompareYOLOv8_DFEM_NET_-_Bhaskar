@@ -532,7 +532,10 @@ def main():
     print("\n--- 2. Training DFEM-Net ---")
     try:
         # Run in subprocess to isolate modules
-        subprocess.run([sys.executable, "train_dfem.py"], check=True, cwd="DFEM_Experiment")
+        # Use -u for unbuffered output to see logs in real-time on Kaggle
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        subprocess.run([sys.executable, "-u", "train_dfem.py"], check=True, cwd="DFEM_Experiment", env=env)
     except Exception as e:
         print(f"DFEM-Net Training Failed: {e}")
 

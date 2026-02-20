@@ -419,7 +419,10 @@ def main():
     print("\n--- 2. Training BhaskarNet ---")
     try:
         # Run in subprocess to isolate modules
-        subprocess.run([sys.executable, "train_bhaskar.py"], check=True, cwd="Bhaskar_Experiment")
+        # Use -u for unbuffered output to see logs in real-time on Kaggle
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        subprocess.run([sys.executable, "-u", "train_bhaskar.py"], check=True, cwd="Bhaskar_Experiment", env=env)
     except Exception as e:
         print(f"BhaskarNet Training Failed: {e}")
 
