@@ -432,7 +432,18 @@ class DeformableConv2d(nn.Module):
         # x: [N, C, H, W]
         # grid: [N, H_out, W_out * kh * kw, 2]
         # output: [N, C, H_out, W_out * kh * kw]
-        sampled_features = F.grid_sample(x, sampling_locations_flat, align_corners=True, padding_mode='zeros')
+        #
+        # AMP FIX: F.grid_sample requires BOTH input and grid to be float32.
+        # Under AMP, x may be cast to float16 (HalfTensor) which causes a
+        # RuntimeError. We cast to float32 here and restore the original dtype after.
+        orig_dtype = x.dtype
+        sampled_features = F.grid_sample(
+            x.float(),
+            sampling_locations_flat.float(),
+            align_corners=True,
+            padding_mode='zeros'
+        )
+        sampled_features = sampled_features.to(orig_dtype)
         
         # Reshape back: [N, C, H_out, W_out, kh*kw]
         sampled_features = sampled_features.view(N, C, H_out, W_out, kh*kw)
@@ -590,6 +601,91 @@ if __name__ == "__main__":
 """
 
 # ==========================================
+# 2b. BHASKAR-SPECIFIC RUNNER (with YOLOv8 weight transfer)
+# ==========================================
+
+BHASKAR_RUNNER_SCRIPT_TEMPLATE = r"""
+import sys
+import os
+import torch
+from ultralytics import YOLO
+import ultralytics.nn.tasks
+import ultralytics.nn.modules
+import ultralytics.nn.modules.block
+
+# Ensure we can import modules from current directory
+sys.path.append(os.getcwd())
+
+print(f"--- Setting up {MODEL_NAME} ---")
+
+try:
+    from TuaBottleneck import TuaBottleneck
+    from saclseq import Scalseq
+    from zoomcat import Zoomcat
+    
+    print("Modules imported successfully.")
+
+    # Register Modules in Ultralytics Registry
+    setattr(ultralytics.nn.modules.block, 'TuaBottleneck', TuaBottleneck)
+    setattr(ultralytics.nn.modules.block, 'Scalseq', Scalseq)
+    setattr(ultralytics.nn.modules.block, 'Zoomcat', Zoomcat)
+    setattr(ultralytics.nn.modules, 'TuaBottleneck', TuaBottleneck)
+    setattr(ultralytics.nn.modules, 'Scalseq', Scalseq)
+    setattr(ultralytics.nn.modules, 'Zoomcat', Zoomcat)
+    setattr(ultralytics.nn.tasks, 'TuaBottleneck', TuaBottleneck)
+    setattr(ultralytics.nn.tasks, 'Scalseq', Scalseq)
+    setattr(ultralytics.nn.tasks, 'Zoomcat', Zoomcat)
+    
+    print("Modules registered.")
+
+except ImportError as e:
+    print(f"CRITICAL ERROR: Could not import custom modules: {e}")
+    sys.exit(1)
+
+def train():
+    print(f"--- Starting Training for {MODEL_NAME} ---")
+
+    # --- PRETRAINED WEIGHT TRANSFER ---
+    # Load YOLOv8n pretrained weights, then build the custom arch.
+    # strict=False copies ONLY matching layers (Conv, SPPF, C2f, Detect head)
+    # and silently skips mismatched layers (TuaBottleneck, Scalseq, Zoomcat).
+    # This gives the network a warm start so mAP appears by epoch 2-5
+    # instead of staying at 0 for many epochs.
+    print("Loading YOLOv8n pretrained weights for partial transfer...")
+    pre = YOLO("yolov8n.pt")
+    model = YOLO("{YAML_FILE}")
+
+    # IMPORTANT: strict=False skips MISSING keys but still RAISES on shape mismatches.
+    # We must manually filter to only the tensors whose shapes match exactly.
+    pre_state   = pre.model.state_dict()
+    own_state   = model.model.state_dict()
+    compatible  = {
+        k: v for k, v in pre_state.items()
+        if k in own_state and v.shape == own_state[k].shape
+    }
+    incompatible = model.model.load_state_dict(compatible, strict=False)
+    print(f"  Shape-compatible keys transferred : {len(compatible)}/{len(pre_state)}")
+    print(f"  Skipped (shape mismatch/missing)  : {len(pre_state) - len(compatible)}")
+    print("  Conv stem + SPPF + C2f neck layers are warm-started.")
+    print("  TuaBottleneck / Scalseq / Zoomcat start from random init.")
+
+    # Train with transferred initialization
+    results = model.train(
+        data='coco128.yaml',
+        epochs={EPOCHS},
+        imgsz=640,
+        batch=4,
+        project='Kaggle_Benchmark',
+        name="{RUN_NAME}",
+        amp={AMP}
+    )
+    print(f"Training for {MODEL_NAME} complete.")
+
+if __name__ == "__main__":
+    train()
+"""
+
+# ==========================================
 # 3. MAIN LOGIC
 # ==========================================
 
@@ -607,8 +703,8 @@ def setup_bhaskar():
     write_file(os.path.join(base, "zoomcat.py"), ZOOMCAT)
     write_file(os.path.join(base, "bhaskar_net.yaml"), MODEL_YAML)
     
-    # Write Runner
-    script = RUNNER_SCRIPT_TEMPLATE.replace("{MODEL_NAME}", "BhaskarNet")
+    # Write Runner (uses BHASKAR template with YOLOv8 partial weight transfer)
+    script = BHASKAR_RUNNER_SCRIPT_TEMPLATE.replace("{MODEL_NAME}", "BhaskarNet")
     script = script.replace("{YAML_FILE}", "bhaskar_net.yaml")
     script = script.replace("{RUN_NAME}", "Bhaskar_Run")
     script = script.replace("{EPOCHS}", "50")
@@ -630,37 +726,68 @@ def setup_dfem():
     script = script.replace("{YAML_FILE}", "dfem_net.yaml")
     script = script.replace("{RUN_NAME}", "DFEM_Run")
     script = script.replace("{EPOCHS}", "50")
-    script = script.replace("{AMP}", "True") # Pure Python Deformable Conv stable with AMP
+    script = script.replace("{AMP}", "False") # Disable AMP: grid_sample has FP16 instability
     write_file(os.path.join(base, "train_dfem.py"), script)
+
+def run_streaming(cmd, cwd, env, label):
+    """
+    Run a subprocess and stream its stdout+stderr line-by-line back to
+    the Kaggle notebook cell in real-time.
+
+    Why: subprocess.run() in a Jupyter kernel swallows all child-process
+    output — the cell looks frozen even though training is running fine.
+    Using Popen + PIPE + a read loop prints every epoch log as it arrives.
+    """
+    import io
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merge stderr into stdout
+        text=True,
+        bufsize=1,                  # line-buffered
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
 
 def main():
     print("--- 1. Setting up Workspaces ---")
     setup_bhaskar()
     setup_dfem()
     print("Workspaces created: Bhaskar_Experiment/, DFEM_Experiment/")
-    
-    # Download COCO128 if not present (handled by YOLO auto-download usually, but usually caches)
-    
+
     print("\n--- 2. Training YOLOv8 (Benchmark) ---")
-    if os.path.exists("runs/detect/Kaggle_Benchmark/YOLOv8_Run/weights/best.pt"):
-        print("YOLOv8 training already appears complete. Skipping.")
-    else:
-        try:
-            model = YOLO('yolov8n.yaml')
-            model.train(data='coco128.yaml', epochs=50, imgsz=640, project='Kaggle_Benchmark', name='YOLOv8_Run')
-        except Exception as e:
-            print(f"YOLOv8 Training Failed: {e}")
+    try:
+        model = YOLO("yolov8n.pt")
+        model.train(data='coco128.yaml', epochs=50, imgsz=640, batch=4,
+                    project='Kaggle_Benchmark', name='YOLOv8_Run', exist_ok=True)
+    except Exception as e:
+        print(f"YOLOv8 Training Failed: {e}")
 
     print("\n--- 3. Training BhaskarNet ---")
     if os.path.exists("Bhaskar_Experiment/runs/detect/Kaggle_Benchmark/Bhaskar_Run/weights/best.pt"):
         print("BhaskarNet training already complete. Skipping.")
     else:
         try:
-            # Run in subprocess to isolate modules
-            # Use -u for unbuffered output to see logs in real-time on Kaggle
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
-            subprocess.run([sys.executable, "-u", "train_bhaskar.py"], check=True, cwd="Bhaskar_Experiment", env=env)
+            run_streaming(
+                [sys.executable, "-u", "train_bhaskar.py"],
+                cwd="Bhaskar_Experiment",
+                env=env,
+                label="BhaskarNet",
+            )
         except Exception as e:
             print(f"BhaskarNet Training Failed: {e}")
 
@@ -669,15 +796,19 @@ def main():
         print("DFEM-Net training already complete. Skipping.")
     else:
         try:
-            # Run in subprocess to isolate modules
-            # Use -u for unbuffered output to see logs in real-time on Kaggle
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
-            subprocess.run([sys.executable, "-u", "train_dfem.py"], check=True, cwd="DFEM_Experiment", env=env)
+            run_streaming(
+                [sys.executable, "-u", "train_dfem.py"],
+                cwd="DFEM_Experiment",
+                env=env,
+                label="DFEM-Net",
+            )
         except Exception as e:
             print(f"DFEM-Net Training Failed: {e}")
-        
+
     print("\nAll experiments complete. Check 'Kaggle_Benchmark' folder for results.")
+
 
 if __name__ == "__main__":
     main()

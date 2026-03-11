@@ -5,6 +5,7 @@ import subprocess
 import random
 import glob
 import re
+import shutil
 
 
 # --- AUTO-INSTALL DEPENDENCIES ---
@@ -22,7 +23,7 @@ from ultralytics import YOLO
 # --- 1. CONFIGURATION ---
 TARGET_TRAIN = 1000  # We keep 1k images for training
 TARGET_VAL = 200     # We keep 200 images for validation
-EPOCHS = 10          # 10 Epochs is sufficient for a 1k subset
+EPOCHS = 40          # 40 epochs for proper convergence on a 1k subset
 
 
 # ==========================================
@@ -281,7 +282,7 @@ class Zoomcat(nn.Module):
 """
 
 MODEL_YAML = r"""# NET Configuration
-nc: 80
+nc: 10
 backbone:
   # [from, repeats, module, args]
   - [-1, 1, Conv, [16, 3, 2]]  # 0-P1/2
@@ -317,8 +318,14 @@ head:
   # 20. Zoomcat
   - [-1, 1, Zoomcat, [64]] 
 
-  # 21. Detect HEAD
-  - [[15, 12, 9], 1, Detect, [nc]]
+  # 21. Normalize P4 channels: 128 -> 64 (required: Detect needs uniform channels)
+  - [12, 1, Conv, [64, 1, 1]]
+
+  # 22. Normalize P5 channels: 256 -> 64
+  - [9, 1, Conv, [64, 1, 1]]
+
+  # 23. Detect HEAD — all inputs now have 64 channels: 20(64), 21(64), 22(64)
+  - [[20, 21, 22], 1, Detect, [nc]]
 """
 
 # --- DFEM-Net Specific Files ---
@@ -440,15 +447,18 @@ class DeformableConv2d(nn.Module):
         
         sampling_locations_flat = sampling_locations_norm.view(N, H_out, -1, 2) 
         
-        # FIX: Ensure grid dtype matches input dtype (crucial for AMP/Half Precision)
-        if sampling_locations_flat.dtype != x.dtype:
-            sampling_locations_flat = sampling_locations_flat.to(x.dtype)
-
-        # Sample! 
-        # x: [N, C, H, W]
-        # grid: [N, H_out, W_out * kh * kw, 2]
-        # output: [N, C, H_out, W_out * kh * kw]
-        sampled_features = F.grid_sample(x, sampling_locations_flat, align_corners=True, padding_mode='zeros')
+        # AMP FIX: F.grid_sample requires BOTH input and grid to be float32.
+        # Under AMP, x is cast to float16 (HalfTensor). Casting the grid to
+        # match float16 does NOT fix it — cuDNN grid_sampler always needs float32.
+        # Cast both to float32, run grid_sample, then restore original dtype.
+        orig_dtype = x.dtype
+        sampled_features = F.grid_sample(
+            x.float(),
+            sampling_locations_flat.float(),
+            align_corners=True,
+            padding_mode='zeros'
+        )
+        sampled_features = sampled_features.to(orig_dtype)
         
         # Reshape back: [N, C, H_out, W_out, kh*kw]
         sampled_features = sampled_features.view(N, C, H_out, W_out, kh*kw)
@@ -586,6 +596,9 @@ except ImportError as e:
 def train():
     print(f"--- Starting Training for {MODEL_NAME} ---")
     
+    # Suppress tqdm progress bars and per-batch logs — epoch-level only
+    os.environ["TQDM_DISABLE"] = "1"
+    
     # Load Model
     model = YOLO("{YAML_FILE}")
     
@@ -593,11 +606,13 @@ def train():
     results = model.train(
         data='VisDrone.yaml',
         epochs={EPOCHS},
-        imgsz=640,
+        imgsz=800,      # Higher res preserves tiny VisDrone objects (often 10-20px)
         batch=4,
         project='Kaggle_Benchmark_VisDrone',
         name="{RUN_NAME}",
-        amp={AMP}
+        amp={AMP},
+        save_json=True,
+        verbose=False
     )
     print(f"Training for {MODEL_NAME} complete.")
 
@@ -654,6 +669,8 @@ def shrink_dataset(image_dir, label_dir, target_count):
 
 def setup_bhaskar():
     base = "Bhaskar_Experiment"
+    # Force clean slate — prevents stale yaml from previous runs
+    shutil.rmtree(base, ignore_errors=True)
     os.makedirs(base, exist_ok=True)
     write_file(os.path.join(base, "dfem_parts.py"), BHASKAR_DFEM_PARTS)
     write_file(os.path.join(base, "saclseq.py"), BHASKAR_SACLSEQ)
@@ -661,6 +678,9 @@ def setup_bhaskar():
     write_file(os.path.join(base, "TuaBottleneck.py"), TUA_BOTTLENECK)
     write_file(os.path.join(base, "zoomcat.py"), ZOOMCAT)
     write_file(os.path.join(base, "bhaskar_net.yaml"), MODEL_YAML)
+    # Verify yaml written correctly
+    print("=== BHASKAR YAML (last 10 lines) ===")
+    print('\n'.join(MODEL_YAML.strip().splitlines()[-10:]))
     
     # Write Runner
     script = RUNNER_SCRIPT_TEMPLATE.replace("{MODEL_NAME}", "BhaskarNet")
@@ -673,6 +693,8 @@ def setup_bhaskar():
 
 def setup_dfem():
     base = "DFEM_Experiment"
+    # Force clean slate — prevents stale yaml from previous runs
+    shutil.rmtree(base, ignore_errors=True)
     os.makedirs(base, exist_ok=True)
     write_file(os.path.join(base, "dfem_parts.py"), DFEM_DFEM_PARTS) # Uses Deformable Conv
     write_file(os.path.join(base, "saclseq.py"), DFEM_SACLSEQ)       # Uses 3D Conv
@@ -686,12 +708,41 @@ def setup_dfem():
     script = script.replace("{YAML_FILE}", "dfem_net.yaml")
     script = script.replace("{RUN_NAME}", "DFEM_Run")
     script = script.replace("{EPOCHS}", str(EPOCHS))
-    # Pure Python implementation is stable with AMP
-    script = script.replace("{AMP}", "True") 
+    # AMP disabled: grid_sample in DeformableConv2d is unstable with FP16
+    script = script.replace("{AMP}", "False")
     write_file(os.path.join(base, "train_dfem.py"), script)
 
 
+def run_streaming(cmd, cwd, env, label):
+    """
+    Stream subprocess stdout+stderr line-by-line to the Kaggle notebook cell.
+    subprocess.run() in a Jupyter kernel swallows all child output — the cell
+    looks frozen. Popen + PIPE + a read loop prints every epoch log live.
+    """
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # merge stderr into stdout
+        text=True,
+        bufsize=1,                 # line-buffered
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        for line in proc.stdout:
+            print(line, end="", flush=True)
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, cmd)
+
+
 def main():
+    print("=== VisdroneTrain1k.py v4 — Fixed Detect channels (layers 21,22 normalize to 64ch) ===")
     print("--- 1. Setting up Workspaces ---")
     setup_bhaskar()
     setup_dfem()
@@ -736,27 +787,80 @@ def main():
 
     
     print("\n--- 2. Training YOLOv8 (Benchmark) ---")
-    print("Skipping YOLOv8 (Already trained)")
-    # try:
-    #     model = YOLO('yolov8n.yaml')
-    #     # Using VisDrone.yaml (Ultralytics handles download automatically)
-    #     model.train(data='VisDrone.yaml', epochs=EPOCHS, imgsz=640, project='Kaggle_Benchmark_VisDrone', name='YOLOv8_Run')
+    # Write a self-contained YOLOv8 runner script
+    yolov8_dir = "YOLOv8_Experiment"
+    shutil.rmtree(yolov8_dir, ignore_errors=True)
+    os.makedirs(yolov8_dir, exist_ok=True)
+    yolov8_script = f"""
+import sys
+import os
+from ultralytics import YOLO
 
-    # except Exception as e:
-    #     print(f"YOLOv8 Training Failed: {e}")
+sys.path.append(os.getcwd())
+
+print("--- Setting up YOLOv8n Benchmark ---")
+
+def train():
+    print("--- Starting Training for YOLOv8n ---")
+    
+    # Suppress tqdm progress bars and per-batch logs — epoch-level only
+    os.environ["TQDM_DISABLE"] = "1"
+    
+    model = YOLO('yolov8n.pt')   # Use pretrained nano weights as the baseline
+    results = model.train(
+        data='VisDrone.yaml',
+        epochs={EPOCHS},
+        imgsz=800,
+        batch=4,
+        project='Kaggle_Benchmark_VisDrone',
+        name='YOLOv8_Run',
+        amp=True,
+        save_json=True,
+        verbose=False
+    )
+    print("Training for YOLOv8n complete.")
+
+if __name__ == "__main__":
+    train()
+"""
+    write_file(os.path.join(yolov8_dir, "train_yolov8.py"), yolov8_script)
+
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        run_streaming(
+            [sys.executable, "-u", "train_yolov8.py"],
+            cwd=yolov8_dir,
+            env=env,
+            label="YOLOv8n",
+        )
+    except Exception as e:
+        print(f"YOLOv8 Training Failed: {e}")
 
     print("\n--- 3. Training BhaskarNet ---")
-    print("Skipping BhaskarNet (Already trained)")
-    # try:
-    #     # Run in subprocess to isolate modules
-    #     subprocess.run([sys.executable, "train_bhaskar.py"], check=True, cwd="Bhaskar_Experiment")
-    # except Exception as e:
-    #     print(f"BhaskarNet Training Failed: {e}")
+    try:
+        # Run in subprocess to isolate modules
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        run_streaming(
+            [sys.executable, "-u", "train_bhaskar.py"],
+            cwd="Bhaskar_Experiment",
+            env=env,
+            label="BhaskarNet",
+        )
+    except Exception as e:
+        print(f"BhaskarNet Training Failed: {e}")
 
     print("\n--- 4. Training DFEM-Net ---")
     try:
-        # Run in subprocess to isolate modules
-        subprocess.run([sys.executable, "train_dfem.py"], check=True, cwd="DFEM_Experiment")
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        run_streaming(
+            [sys.executable, "-u", "train_dfem.py"],
+            cwd="DFEM_Experiment",
+            env=env,
+            label="DFEM-Net",
+        )
     except Exception as e:
         print(f"DFEM-Net Training Failed: {e}")
         
