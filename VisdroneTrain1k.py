@@ -745,7 +745,7 @@ def main():
     print("=== VisdroneTrain1k.py v4 — Fixed Detect channels (layers 21,22 normalize to 64ch) ===")
     print("--- 1. Setting up Workspaces ---")
     setup_bhaskar()
-    setup_dfem()
+    # setup_dfem()
     print("Workspaces created: Bhaskar_Experiment/, DFEM_Experiment/")
     
     # --- DATASET PRUNING ---
@@ -786,56 +786,56 @@ def main():
          print(f"Warning: Could not locate dataset at {base_path}. Skipping reduction.")
 
     
-    print("\n--- 2. Training YOLOv8 (Benchmark) ---")
-    # Write a self-contained YOLOv8 runner script
-    yolov8_dir = "YOLOv8_Experiment"
-    shutil.rmtree(yolov8_dir, ignore_errors=True)
-    os.makedirs(yolov8_dir, exist_ok=True)
-    yolov8_script = f"""
-import sys
-import os
-from ultralytics import YOLO
+    # print("\n--- 2. Training YOLOv8 (Benchmark) ---")
+    # # Write a self-contained YOLOv8 runner script
+    # yolov8_dir = "YOLOv8_Experiment"
+    # shutil.rmtree(yolov8_dir, ignore_errors=True)
+    # os.makedirs(yolov8_dir, exist_ok=True)
+    # yolov8_script = f"""
+# import sys
+# import os
+# from ultralytics import YOLO
+# 
+# sys.path.append(os.getcwd())
+# 
+# print("--- Setting up YOLOv8n Benchmark ---")
+# 
+# def train():
+#     print("--- Starting Training for YOLOv8n ---")
+#     
+#     # Suppress tqdm progress bars and per-batch logs — epoch-level only
+#     os.environ["TQDM_DISABLE"] = "1"
+#     
+#     model = YOLO('yolov8n.pt')   # Use pretrained nano weights as the baseline
+#     results = model.train(
+#         data='VisDrone.yaml',
+#         epochs={EPOCHS},
+#         imgsz=800,
+#         batch=4,
+#         project='Kaggle_Benchmark_VisDrone',
+#         name='YOLOv8_Run',
+#         amp=True,
+#         save_json=True,
+#         verbose=False
+#     )
+#     print("Training for YOLOv8n complete.")
+# 
+# if __name__ == "__main__":
+#     train()
+# """
+    # write_file(os.path.join(yolov8_dir, "train_yolov8.py"), yolov8_script)
 
-sys.path.append(os.getcwd())
-
-print("--- Setting up YOLOv8n Benchmark ---")
-
-def train():
-    print("--- Starting Training for YOLOv8n ---")
-    
-    # Suppress tqdm progress bars and per-batch logs — epoch-level only
-    os.environ["TQDM_DISABLE"] = "1"
-    
-    model = YOLO('yolov8n.pt')   # Use pretrained nano weights as the baseline
-    results = model.train(
-        data='VisDrone.yaml',
-        epochs={EPOCHS},
-        imgsz=800,
-        batch=4,
-        project='Kaggle_Benchmark_VisDrone',
-        name='YOLOv8_Run',
-        amp=True,
-        save_json=True,
-        verbose=False
-    )
-    print("Training for YOLOv8n complete.")
-
-if __name__ == "__main__":
-    train()
-"""
-    write_file(os.path.join(yolov8_dir, "train_yolov8.py"), yolov8_script)
-
-    try:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        run_streaming(
-            [sys.executable, "-u", "train_yolov8.py"],
-            cwd=yolov8_dir,
-            env=env,
-            label="YOLOv8n",
-        )
-    except Exception as e:
-        print(f"YOLOv8 Training Failed: {e}")
+    # try:
+    #     env = os.environ.copy()
+    #     env["PYTHONUNBUFFERED"] = "1"
+    #     run_streaming(
+    #         [sys.executable, "-u", "train_yolov8.py"],
+    #         cwd=yolov8_dir,
+    #         env=env,
+    #         label="YOLOv8n",
+    #     )
+    # except Exception as e:
+    #     print(f"YOLOv8 Training Failed: {e}")
 
     print("\n--- 3. Training BhaskarNet ---")
     try:
@@ -851,18 +851,18 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"BhaskarNet Training Failed: {e}")
 
-    print("\n--- 4. Training DFEM-Net ---")
-    try:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
-        run_streaming(
-            [sys.executable, "-u", "train_dfem.py"],
-            cwd="DFEM_Experiment",
-            env=env,
-            label="DFEM-Net",
-        )
-    except Exception as e:
-        print(f"DFEM-Net Training Failed: {e}")
+    # print("\n--- 4. Training DFEM-Net ---")
+    # try:
+    #     env = os.environ.copy()
+    #     env["PYTHONUNBUFFERED"] = "1"
+    #     run_streaming(
+    #         [sys.executable, "-u", "train_dfem.py"],
+    #         cwd="DFEM_Experiment",
+    #         env=env,
+    #         label="DFEM-Net",
+    #     )
+    # except Exception as e:
+    #     print(f"DFEM-Net Training Failed: {e}")
         
     print("\nAll experiments complete. Check 'Kaggle_Benchmark_VisDrone' folder for results.")
 
